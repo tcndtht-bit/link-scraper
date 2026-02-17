@@ -23,4 +23,4 @@ Headless browser (Puppeteer) для парсинга страниц товаро
    - Добавь `LINK_SCRAPER_URL` = `https://твой-link-scraper.up.railway.app`
 4. Сделай redeploy мини-апп
 
-При ошибке загрузки страницы (блокировка, таймаут) Worker вызовет link-scraper как fallback.
+Весь анализ ссылок выполняется только в link-scraper (Puppeteer). Worker — прокси к нему.
