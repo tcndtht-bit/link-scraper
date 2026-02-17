@@ -6,6 +6,7 @@
  */
 const express = require("express");
 const puppeteer = require("puppeteer");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -402,6 +403,12 @@ app.get("/wish-text", async (req, res) => {
   res.json({ text: entry.text, ...extracted });
 });
 
+const BUCKET = "wish-images";
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
 app.post("/analyze-image", async (req, res) => {
   const body = req.body || {};
   let imageBase64 = body.image || body.base64;
@@ -420,7 +427,25 @@ app.post("/analyze-image", async (req, res) => {
   }
   try {
     const extracted = await analyzeImage(imageBase64);
-    res.json(extracted);
+    let imageUrl = null;
+    if (supabase) {
+      try {
+        const rawB64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
+        const buf = Buffer.from(rawB64, "base64");
+        const path = `${randomId()}_${Date.now()}.jpg`;
+        const { data: uploadData, error } = await supabase.storage.from(BUCKET).upload(path, buf, {
+          contentType: "image/jpeg",
+          upsert: false,
+        });
+        if (!error && uploadData) {
+          const { data: urlData } = supabase.storage.from(BUCKET).getPublicUrl(path);
+          imageUrl = urlData?.publicUrl || null;
+        }
+      } catch (e) {
+        console.warn("Supabase upload failed:", e.message);
+      }
+    }
+    res.json({ ...extracted, image: imageUrl });
   } catch (e) {
     console.error("analyze-image error:", e);
     res.status(502).json({ name: "N/A", price: null, currency: null, size: null });
