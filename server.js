@@ -1,14 +1,99 @@
 /**
- * Link Scraper — headless browser для парсинга страниц товаров.
- * Используется как fallback, когда Cloudflare Worker не может загрузить страницу.
- * API: GET /?url=https://...
+ * Link Scraper — headless browser для парсинга страниц товаров + анализ текста желаний.
+ * API: GET /?url=... — парсинг страницы
+ * POST /store-wish-text — сохранить текст желания, вернуть id
+ * GET /wish-text?id=&analyze=1 — получить текст и/или анализ через LLM
  */
 const express = require("express");
 const puppeteer = require("puppeteer");
 
 const app = express();
+app.use(express.json({ limit: "10kb" }));
+
 const PORT = process.env.PORT || 3000;
 const TIMEOUT = 25000;
+const WISH_TEXT_TTL = 10 * 60 * 1000; // 10 min
+
+const wishTextStore = new Map();
+
+function randomId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+const WISH_TEXT_PROMPT = `Текст начинается со слова «хочу». Извлеки данные. Верни ТОЛЬКО JSON:
+{"name":"строка","price":число или null,"currency":"строка или null","size":"строка или null"}
+
+Правила:
+1. name — ТОЛЬКО название товара/желания (что хочет). БЕЗ слова «хочу». БЕЗ цены, размеров, валют. Примеры: «наушники AirPods Pro», «кроссовки Nike», «книга Сто лет одиночества». НЕ бери числа, цены, размеры в name.
+2. price — ТОЛЬКО если явно указана сумма за товар (число рядом с руб, ₽, Br, BYN, $, USD, €, EUR, долларов, рублей). НЕ бери: год (2024), количество (2 штуки), размер (42). Иначе null.
+3. currency — валюта из цены. Нормализуй: руб/RUB/₽ → ₽, BYN/Br/бун → Br, USD/$/долл → $, EUR/€/евр → €. Иначе null.
+4. size — ТОЛЬКО размер одежды/обуви (42, XL, EU 43, US 10). Иначе null.`;
+
+// Fallback: regex-парсинг без LLM
+function analyzeWishTextFallback(text) {
+  let s = text.replace(/^хочу\s+/i, "").trim() || "Желание";
+  let price = null;
+  let currency = null;
+  let size = null;
+  const priceRe = /(\d[\d\s.]*)\s*(руб\.?|₽|Br|BYN|\$|USD|€|EUR|долларов?|рублей|бун\.?)/i;
+  const m = s.match(priceRe);
+  if (m) {
+    const num = parseFloat(m[1].replace(/\s/g, "").replace(",", "."));
+    if (!isNaN(num) && num < 1e9) {
+      price = num;
+      const c = m[2].toLowerCase();
+      if (c.includes("руб") || c === "₽") currency = "₽";
+      else if (c.includes("byn") || c.includes("бун")) currency = "Br";
+      else if (c.includes("долл") || c === "$") currency = "$";
+      else if (c.includes("eur") || c.includes("евр")) currency = "€";
+      s = s.replace(priceRe, "").replace(/\s+/g, " ").trim();
+    }
+  }
+  const sizeRe = /\b(XS|S|M|L|XL|XXL|EU\s*\d+|US\s*\d+|\d{2})\b/i;
+  const sm = s.match(sizeRe);
+  if (sm) {
+    const sz = sm[1];
+    if (/^\d{2}$/.test(sz) && parseInt(sz, 10) >= 35 && parseInt(sz, 10) <= 52) size = sz;
+    else if (/^(XS|S|M|L|XL|XXL)$/i.test(sz) || /^(EU|US)\s*\d+/i.test(sz)) size = sz;
+  }
+  return { name: s || "Желание", price, currency, size };
+}
+
+async function analyzeWishText(text) {
+  const apiKey = process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY;
+  if (!apiKey) return analyzeWishTextFallback(text);
+  const isGroq = !!process.env.GROQ_API_KEY;
+  const url = isGroq ? "https://api.groq.com/openai/v1/chat/completions" : "https://openrouter.ai/api/v1/chat/completions";
+  const model = isGroq ? "meta-llama/llama-4-scout-17b-16e-instruct" : "google/gemma-3-27b-it:free";
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: WISH_TEXT_PROMPT + "\n\n" + text }],
+      max_tokens: 300,
+    }),
+  });
+  if (!res.ok) return analyzeWishTextFallback(text);
+  const data = await res.json();
+  const t = data.choices?.[0]?.message?.content;
+  if (!t) return analyzeWishTextFallback(text);
+  const m = t.match(/\{[\s\S]*\}/);
+  if (!m) return analyzeWishTextFallback(text);
+  try {
+    const parsed = JSON.parse(m[0]);
+    const cur = parsed.currency;
+    const curMap = { BYN: "Br", Br: "Br", RUB: "₽", руб: "₽", USD: "$", EUR: "€", KZT: "₸" };
+    return {
+      name: parsed.name && String(parsed.name).trim() ? parsed.name : analyzeWishTextFallback(text).name,
+      price: typeof parsed.price === "number" && !isNaN(parsed.price) ? parsed.price : null,
+      currency: curMap[cur] || (typeof cur === "string" ? cur : null) || null,
+      size: typeof parsed.size === "string" ? parsed.size : null,
+    };
+  } catch {
+    return analyzeWishTextFallback(text);
+  }
+}
 
 function extractMeta(html, name) {
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -140,9 +225,31 @@ function parse(html, targetUrl) {
 
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
-  res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
+});
+
+app.post("/store-wish-text", (req, res) => {
+  const text = req.body?.text;
+  if (!text || typeof text !== "string" || text.length > 2000) {
+    return res.status(400).json({ error: "Invalid text" });
+  }
+  const id = randomId();
+  wishTextStore.set(id, { text, expires: Date.now() + WISH_TEXT_TTL });
+  setTimeout(() => wishTextStore.delete(id), WISH_TEXT_TTL);
+  res.json({ id });
+});
+
+app.get("/wish-text", async (req, res) => {
+  const id = req.query.id;
+  const analyze = req.query.analyze === "1";
+  const entry = wishTextStore.get(id);
+  if (!entry) return res.status(404).json({ error: "Not found or expired" });
+  if (!analyze) return res.json({ text: entry.text });
+  const extracted = await analyzeWishText(entry.text);
+  res.json({ text: entry.text, ...extracted });
 });
 
 app.get("/", async (req, res) => {
