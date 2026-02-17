@@ -1,0 +1,17 @@
+{
+  "name": "link-scraper",
+  "version": "1.0.0",
+  "description": "Headless browser scraper for product pages (Railway)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^23.0.0"
+  }
+}
