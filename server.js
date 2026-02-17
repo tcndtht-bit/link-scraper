@@ -8,7 +8,7 @@ const express = require("express");
 const puppeteer = require("puppeteer");
 
 const app = express();
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 const TIMEOUT = 25000;
@@ -28,6 +28,12 @@ const WISH_TEXT_PROMPT = `Текст начинается со слова «хо
 2. price — ТОЛЬКО если явно указана сумма за товар (число рядом с руб, ₽, Br, BYN, $, USD, €, EUR, долларов, рублей). НЕ бери: год (2024), количество (2 штуки), размер (42). Иначе null.
 3. currency — валюта из цены. Нормализуй: руб/RUB/₽ → ₽, BYN/Br/бун → Br, USD/$/долл → $, EUR/€/евр → €. Иначе null.
 4. size — ТОЛЬКО размер одежды/обуви (42, XL, EU 43, US 10). Иначе null.`;
+
+const VISION_PROMPT = `Проанализируй изображение и извлеки информацию о товаре. Верни ТОЛЬКО валидный JSON без пояснений:
+{"name":"строка или N/A","price":число или null,"currency":"строка или null","size":"строка или null"}
+1. name — название товара (существительное/фраза). Иначе "N/A".
+2. price и currency — связка число + валюта (BYN, Br, ₽, $, €, руб, долл). Иначе null.
+3. size — только для одежды/обуви (EU 25-50, XXS-XL). Иначе null.`;
 
 // Fallback: regex-парсинг без LLM
 function analyzeWishTextFallback(text) {
@@ -93,6 +99,150 @@ async function analyzeWishText(text) {
   } catch {
     return analyzeWishTextFallback(text);
   }
+}
+
+async function analyzeImage(imageBase64) {
+  const apiKey =
+    process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY;
+  if (!apiKey) return { name: "N/A", price: null, currency: null, size: null };
+
+  // Groq
+  if (process.env.GROQ_API_KEY) {
+    try {
+      const dataUrl = imageBase64.startsWith("data:")
+        ? imageBase64
+        : `data:image/jpeg;base64,${imageBase64}`;
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "meta-llama/llama-4-scout-17b-16e-instruct",
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: VISION_PROMPT },
+                { type: "image_url", image_url: { url: dataUrl } },
+              ],
+            },
+          ],
+          max_tokens: 500,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const t = data.choices?.[0]?.message?.content;
+        if (t) {
+          const m = t.match(/\{[\s\S]*\}/);
+          if (m) {
+            const p = JSON.parse(m[0]);
+            return {
+              name: p.name && String(p.name).trim() ? p.name : "N/A",
+              price: typeof p.price === "number" && !isNaN(p.price) ? p.price : null,
+              currency: typeof p.currency === "string" ? p.currency : null,
+              size: typeof p.size === "string" ? p.size : null,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Groq vision error:", e.message);
+    }
+  }
+
+  // OpenRouter
+  if (process.env.OPENROUTER_API_KEY) {
+    try {
+      const dataUrl = imageBase64.startsWith("data:")
+        ? imageBase64
+        : `data:image/jpeg;base64,${imageBase64}`;
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "google/gemma-3-27b-it:free",
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: VISION_PROMPT },
+                { type: "image_url", image_url: { url: dataUrl } },
+              ],
+            },
+          ],
+          max_tokens: 500,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const t = data.choices?.[0]?.message?.content;
+        if (t) {
+          const m = t.match(/\{[\s\S]*\}/);
+          if (m) {
+            const p = JSON.parse(m[0]);
+            return {
+              name: p.name && String(p.name).trim() ? p.name : "N/A",
+              price: typeof p.price === "number" && !isNaN(p.price) ? p.price : null,
+              currency: typeof p.currency === "string" ? p.currency : null,
+              size: typeof p.size === "string" ? p.size : null,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("OpenRouter vision error:", e.message);
+    }
+  }
+
+  // Gemini
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const b64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  { text: VISION_PROMPT },
+                  { inlineData: { mimeType: "image/jpeg", data: b64 } },
+                ],
+              },
+            ],
+          }),
+        }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const t = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (t) {
+          const m = t.match(/\{[\s\S]*\}/);
+          if (m) {
+            const p = JSON.parse(m[0]);
+            return {
+              name: p.name && String(p.name).trim() ? p.name : "N/A",
+              price: typeof p.price === "number" && !isNaN(p.price) ? p.price : null,
+              currency: typeof p.currency === "string" ? p.currency : null,
+              size: typeof p.size === "string" ? p.size : null,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Gemini vision error:", e.message);
+    }
+  }
+
+  return { name: "N/A", price: null, currency: null, size: null };
 }
 
 function extractMeta(html, name) {
@@ -250,6 +400,31 @@ app.get("/wish-text", async (req, res) => {
   if (!analyze) return res.json({ text: entry.text });
   const extracted = await analyzeWishText(entry.text);
   res.json({ text: entry.text, ...extracted });
+});
+
+app.post("/analyze-image", async (req, res) => {
+  const body = req.body || {};
+  let imageBase64 = body.image || body.base64;
+  if (body.imageUrl && typeof body.imageUrl === "string") {
+    try {
+      const r = await fetch(body.imageUrl);
+      if (!r.ok) throw new Error("Fetch failed");
+      const buf = await r.arrayBuffer();
+      imageBase64 = Buffer.from(buf).toString("base64");
+    } catch (e) {
+      return res.status(400).json({ name: "N/A", price: null, currency: null, size: null, error: e.message });
+    }
+  }
+  if (!imageBase64 || typeof imageBase64 !== "string") {
+    return res.status(400).json({ name: "N/A", price: null, currency: null, size: null, error: "Missing image" });
+  }
+  try {
+    const extracted = await analyzeImage(imageBase64);
+    res.json(extracted);
+  } catch (e) {
+    console.error("analyze-image error:", e);
+    res.status(502).json({ name: "N/A", price: null, currency: null, size: null });
+  }
 });
 
 app.get("/", async (req, res) => {
