@@ -104,147 +104,60 @@ async function analyzeWishText(text) {
   }
 }
 
+function parseVisionJson(text) {
+  if (!text) return null;
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const p = JSON.parse(m[0]);
+    return {
+      name: p.name && String(p.name).trim() ? p.name : "N/A",
+      price: typeof p.price === "number" && !isNaN(p.price) ? p.price : null,
+      currency: typeof p.currency === "string" ? p.currency : null,
+      size: typeof p.size === "string" ? p.size : null,
+    };
+  } catch { return null; }
+}
+
+function getVisionProviders(imageBase64) {
+  const dataUrl = imageBase64.startsWith("data:") ? imageBase64 : `data:image/jpeg;base64,${imageBase64}`;
+  const b64raw = imageBase64.replace(/^data:[^;]+;base64,/, "");
+  const providers = [];
+  if (process.env.GROQ_API_KEY) providers.push({
+    name: "Groq",
+    url: "https://api.groq.com/openai/v1/chat/completions",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: { model: "meta-llama/llama-4-scout-17b-16e-instruct", messages: [{ role: "user", content: [{ type: "text", text: VISION_PROMPT }, { type: "image_url", image_url: { url: dataUrl } }] }], max_tokens: 500 },
+    extract: (d) => d.choices?.[0]?.message?.content,
+  });
+  if (process.env.OPENROUTER_API_KEY) providers.push({
+    name: "OpenRouter",
+    url: "https://openrouter.ai/api/v1/chat/completions",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
+    body: { model: "google/gemma-3-27b-it:free", messages: [{ role: "user", content: [{ type: "text", text: VISION_PROMPT }, { type: "image_url", image_url: { url: dataUrl } }] }], max_tokens: 500 },
+    extract: (d) => d.choices?.[0]?.message?.content,
+  });
+  if (process.env.GEMINI_API_KEY) providers.push({
+    name: "Gemini",
+    url: `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    headers: { "Content-Type": "application/json" },
+    body: { contents: [{ parts: [{ text: VISION_PROMPT }, { inlineData: { mimeType: "image/jpeg", data: b64raw } }] }] },
+    extract: (d) => d.candidates?.[0]?.content?.parts?.[0]?.text,
+  });
+  return providers;
+}
+
 async function analyzeImage(imageBase64) {
-  const apiKey =
-    process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY;
-  if (!apiKey) return { name: "N/A", price: null, currency: null, size: null };
-
-  // Groq
-  if (process.env.GROQ_API_KEY) {
+  const providers = getVisionProviders(imageBase64);
+  if (!providers.length) return { name: "N/A", price: null, currency: null, size: null };
+  for (const p of providers) {
     try {
-      const dataUrl = imageBase64.startsWith("data:")
-        ? imageBase64
-        : `data:image/jpeg;base64,${imageBase64}`;
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "meta-llama/llama-4-scout-17b-16e-instruct",
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: VISION_PROMPT },
-                { type: "image_url", image_url: { url: dataUrl } },
-              ],
-            },
-          ],
-          max_tokens: 500,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const t = data.choices?.[0]?.message?.content;
-        if (t) {
-          const m = t.match(/\{[\s\S]*\}/);
-          if (m) {
-            const p = JSON.parse(m[0]);
-            return {
-              name: p.name && String(p.name).trim() ? p.name : "N/A",
-              price: typeof p.price === "number" && !isNaN(p.price) ? p.price : null,
-              currency: typeof p.currency === "string" ? p.currency : null,
-              size: typeof p.size === "string" ? p.size : null,
-            };
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("Groq vision error:", e.message);
-    }
+      const res = await fetch(p.url, { method: "POST", headers: p.headers, body: JSON.stringify(p.body) });
+      if (!res.ok) continue;
+      const result = parseVisionJson(p.extract(await res.json()));
+      if (result) return result;
+    } catch (e) { console.warn(`${p.name} vision error:`, e.message); }
   }
-
-  // OpenRouter
-  if (process.env.OPENROUTER_API_KEY) {
-    try {
-      const dataUrl = imageBase64.startsWith("data:")
-        ? imageBase64
-        : `data:image/jpeg;base64,${imageBase64}`;
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "google/gemma-3-27b-it:free",
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: VISION_PROMPT },
-                { type: "image_url", image_url: { url: dataUrl } },
-              ],
-            },
-          ],
-          max_tokens: 500,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const t = data.choices?.[0]?.message?.content;
-        if (t) {
-          const m = t.match(/\{[\s\S]*\}/);
-          if (m) {
-            const p = JSON.parse(m[0]);
-            return {
-              name: p.name && String(p.name).trim() ? p.name : "N/A",
-              price: typeof p.price === "number" && !isNaN(p.price) ? p.price : null,
-              currency: typeof p.currency === "string" ? p.currency : null,
-              size: typeof p.size === "string" ? p.size : null,
-            };
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("OpenRouter vision error:", e.message);
-    }
-  }
-
-  // Gemini
-  if (process.env.GEMINI_API_KEY) {
-    try {
-      const b64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  { text: VISION_PROMPT },
-                  { inlineData: { mimeType: "image/jpeg", data: b64 } },
-                ],
-              },
-            ],
-          }),
-        }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        const t = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (t) {
-          const m = t.match(/\{[\s\S]*\}/);
-          if (m) {
-            const p = JSON.parse(m[0]);
-            return {
-              name: p.name && String(p.name).trim() ? p.name : "N/A",
-              price: typeof p.price === "number" && !isNaN(p.price) ? p.price : null,
-              currency: typeof p.currency === "string" ? p.currency : null,
-              size: typeof p.size === "string" ? p.size : null,
-            };
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("Gemini vision error:", e.message);
-    }
-  }
-
   return { name: "N/A", price: null, currency: null, size: null };
 }
 
@@ -480,6 +393,20 @@ app.get("/wish-text", async (req, res) => {
   res.json({ text: entry.text, ...extracted });
 });
 
+app.post("/analyze-text", async (req, res) => {
+  const text = req.body?.text;
+  if (!text || typeof text !== "string" || text.length > 2000) {
+    return res.status(400).json({ error: "Invalid text" });
+  }
+  try {
+    const extracted = await analyzeWishText(text);
+    res.json(extracted);
+  } catch (e) {
+    console.error("analyze-text error:", e.message);
+    res.status(502).json(analyzeWishTextFallback(text));
+  }
+});
+
 const BUCKET = "wish-images";
 let supabase = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
@@ -627,26 +554,40 @@ app.get("/", async (req, res) => {
   }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, browser: !!sharedBrowser });
-});
+const BROWSER_ARGS = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"];
 
-(async () => {
+async function launchBrowser() {
   try {
-    sharedBrowser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-      ],
+    if (sharedBrowser) await sharedBrowser.close().catch(() => {});
+  } catch (_) {}
+  sharedBrowser = null;
+  try {
+    sharedBrowser = await puppeteer.launch({ headless: "new", args: BROWSER_ARGS });
+    sharedBrowser.on("disconnected", () => {
+      console.warn("Browser disconnected, restarting...");
+      sharedBrowser = null;
+      launchBrowser().catch((e) => console.error("Browser restart failed:", e.message));
     });
     console.log("Browser launched");
   } catch (e) {
     console.error("Browser launch failed:", e.message);
   }
+}
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, browser: !!sharedBrowser });
+});
+
+async function shutdown() {
+  console.log("Shutting down...");
+  if (sharedBrowser) await sharedBrowser.close().catch(() => {});
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+
+(async () => {
+  await launchBrowser();
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Link Scraper running on port ${PORT}`);
   });
