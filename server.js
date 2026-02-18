@@ -352,13 +352,13 @@ function extractFromJsonBlobs(html, baseUrl) {
         const n = parseFloat(priceM[1]);
         if (n > 0 && n < 1e9) out.price = n;
       }
-      const imgM = inner.match(/"image"\s*:\s*"((https?:\/\/[^"]+|\\/\\/[^"]+|\/[^"]+))"/);
+      const imgM = inner.match(/"image"\s*:\s*"([^"]+)"/);
       if (imgM && !out.image) {
         const url = imgM[1];
         out.image = url.startsWith("http") ? url : (url.startsWith("//") ? "https:" + url : new URL(url, baseUrl).href);
       }
       if (!out.image) {
-        const imgM2 = inner.match(/"mainImage"\s*:\s*"((?:https?:\/\/[^"]+|\\/\\/[^"]+|\/[^"]+))"/);
+        const imgM2 = inner.match(/"mainImage"\s*:\s*"([^"]+)"/);
         if (imgM2) {
           const u = imgM2[1];
           out.image = u.startsWith("http") ? u : (u.startsWith("//") ? "https:" + u : new URL(u, baseUrl).href);
