@@ -371,6 +371,31 @@ function extractFromJsonBlobs(html, baseUrl) {
   return out;
 }
 
+// Эвристики «generic og»: на многих магазинах og:title/og:image от лендинга заказа/логотипа
+const GENERIC_TITLE_PATTERNS = [
+  /оформи\s*заказ|оформление\s*заказа|экспресс-доставк|доставк[аы]|купите\s*в\s*интернет/i,
+  /add\s*to\s*cart|checkout|order\s*now|buy\s*at\s*our\s*store/i,
+  /^\s*$|^[\w\s]{0,25}$/, // пустой или очень короткий
+];
+const LOGO_URL_PATTERN = /\/?(logo|favicon|icon|brand)([-_\d]*)?\.(png|jpg|jpeg|webp|svg)|\.(svg|ico)(\?|$)/i;
+
+function isGenericOgTitle(title) {
+  if (!title || typeof title !== "string") return true;
+  const t = title.trim();
+  if (t.length < 3) return true;
+  return GENERIC_TITLE_PATTERNS.some((re) => re.test(t));
+}
+
+function isLikelyLogoUrl(url) {
+  if (!url || typeof url !== "string") return false;
+  try {
+    const path = new URL(url, "https://x").pathname.toLowerCase();
+    return LOGO_URL_PATTERN.test(path) || /\/logos?\//.test(path);
+  } catch {
+    return false;
+  }
+}
+
 function parse(html, targetUrl) {
   const title = extractTitle(html);
   const ogTitle = extractMeta(html, "og:title");
@@ -380,7 +405,13 @@ function parse(html, targetUrl) {
   const jsonLd = extractJsonLd(html);
   const blob = extractFromJsonBlobs(html, targetUrl);
 
-  let name = ogTitle || (jsonLd && jsonLd.name) || blob.name || title || "N/A";
+  // Предпочитаем jsonLd/blob, если og выглядит как общий текст/логотип (универсально для любых сайтов)
+  const useOgName = ogTitle && !isGenericOgTitle(ogTitle);
+  const useOgImage = ogImage && !isLikelyLogoUrl(ogImage);
+  const nameFromStructured = (jsonLd && jsonLd.name) || blob.name;
+
+  let name =
+    (useOgName && ogTitle) || nameFromStructured || (useOgName && title) || title || "N/A";
   let price = ogPrice ? parseFloat(ogPrice) : null;
   if (price == null && jsonLd && jsonLd.offers) {
     const off = Array.isArray(jsonLd.offers) ? jsonLd.offers[0] : jsonLd.offers;
@@ -404,11 +435,8 @@ function parse(html, targetUrl) {
       jsonLd.additionalProperty.find((p) => p.name === "Размер" || p.name === "Size")?.value) ||
     null;
 
-  let imageUrl =
-    ogImage ||
-    (jsonLd && (Array.isArray(jsonLd.image) ? jsonLd.image[0] : jsonLd.image)) ||
-    blob.image ||
-    null;
+  const imageFromStructured = (jsonLd && (Array.isArray(jsonLd.image) ? jsonLd.image[0] : jsonLd.image)) || blob.image;
+  let imageUrl = (useOgImage && ogImage) || imageFromStructured || null;
   if (imageUrl && !imageUrl.startsWith("http")) imageUrl = new URL(imageUrl, targetUrl).href;
 
   return {
@@ -531,6 +559,43 @@ app.get("/", async (req, res) => {
     await new Promise((r) => setTimeout(r, 1500));
     const html = await page.content();
     const result = parse(html, targetUrl);
+
+    // DOM-подстановка только когда похоже на «плохой» og: название общее или картинка — логотип (без лишнего evaluate на нормальных страницах)
+    const needDomName = isGenericOgTitle(result.name);
+    const needDomImage = !result.image || isLikelyLogoUrl(result.image);
+    if (needDomName || needDomImage) {
+      try {
+        const overrides = await page.evaluate(({ needName, needImage }) => {
+          const out = { name: null, image: null };
+          if (needName) {
+            const h1 = document.querySelector("h1");
+            if (h1) {
+              const t = (h1.textContent || "").trim();
+              if (t && t.length > 2) out.name = t;
+            }
+          }
+          if (needImage) {
+            const sel = "[class*='gallery'] img, [class*='product'] img, [class*='slide'] img, [data-product] img, main img, [role='main'] img, .product img, [class*='Product'] img";
+            const imgs = document.querySelectorAll(sel);
+            for (const img of imgs) {
+              const src = img.src || img.getAttribute("data-src");
+              if (src && !/logo|favicon|icon/i.test(src)) {
+                const w = img.naturalWidth || img.width || 0;
+                if (w >= 200) {
+                  out.image = src;
+                  break;
+                }
+              }
+            }
+          }
+          return out;
+        }, { needName: needDomName, needImage: needDomImage });
+        if (overrides?.name && !isGenericOgTitle(overrides.name)) result.name = overrides.name;
+        if (overrides?.image) result.image = overrides.image;
+      } catch (e) {
+        console.warn("DOM override failed:", e.message);
+      }
+    }
 
     if (result.image) {
       try {
