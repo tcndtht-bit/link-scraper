@@ -13,9 +13,11 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 const TIMEOUT = 25000;
+const PAGE_DELAY_MS = 700;
 const WISH_TEXT_TTL = 10 * 60 * 1000; // 10 min
 
 const wishTextStore = new Map();
+let sharedBrowser = null;
 
 function randomId() {
   return Math.random().toString(36).slice(2, 10);
@@ -502,25 +504,15 @@ app.post("/analyze-image", async (req, res) => {
   }
   try {
     const extracted = await analyzeImage(imageBase64);
-    let imageUrl = null;
+    res.json({ ...extracted, image: null });
     if (supabase) {
-      try {
-        const rawB64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
-        const buf = Buffer.from(rawB64, "base64");
-        const path = `${randomId()}_${Date.now()}.jpg`;
-        const { data: uploadData, error } = await supabase.storage.from(BUCKET).upload(path, buf, {
-          contentType: "image/jpeg",
-          upsert: false,
-        });
-        if (!error && uploadData) {
-          const { data: urlData } = supabase.storage.from(BUCKET).getPublicUrl(path);
-          imageUrl = urlData?.publicUrl || null;
-        }
-      } catch (e) {
-        console.warn("Supabase upload failed:", e.message);
-      }
+      const rawB64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
+      const buf = Buffer.from(rawB64, "base64");
+      const path = `${randomId()}_${Date.now()}.jpg`;
+      supabase.storage.from(BUCKET).upload(path, buf, { contentType: "image/jpeg", upsert: false }).then(({ error }) => {
+        if (error) console.warn("Supabase upload failed:", error.message);
+      }).catch((e) => console.warn("Supabase upload failed:", e.message));
     }
-    res.json({ ...extracted, image: imageUrl });
   } catch (e) {
     console.error("analyze-image error:", e);
     res.status(502).json({ name: "N/A", price: null, currency: null, size: null });
@@ -529,38 +521,31 @@ app.post("/analyze-image", async (req, res) => {
 
 app.get("/", async (req, res) => {
   const targetUrl = req.query.url;
+  const attachImage = req.query.attachImage === "1";
   if (!targetUrl || typeof targetUrl !== "string") {
     return res.status(400).json({ error: "Missing url query parameter" });
   }
   if (!targetUrl.startsWith("https://")) {
     return res.status(400).json({ error: "Only https URLs allowed" });
   }
+  if (!sharedBrowser) {
+    return res.status(503).json({ error: "Browser not ready" });
+  }
 
-  let browser;
+  let page;
   try {
-    browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-      ],
-    });
-    const page = await browser.newPage();
+    page = await sharedBrowser.newPage();
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
     await page.goto(targetUrl, {
-      waitUntil: "networkidle2",
+      waitUntil: "domcontentloaded",
       timeout: TIMEOUT,
     });
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
     const html = await page.content();
     const result = parse(html, targetUrl);
 
-    // DOM-подстановка только когда похоже на «плохой» og: название общее или картинка — логотип (без лишнего evaluate на нормальных страницах)
     const needDomName = isGenericOgTitle(result.name);
     const needDomImage = !result.image || isLikelyLogoUrl(result.image);
     if (needDomName || needDomImage) {
@@ -597,7 +582,8 @@ app.get("/", async (req, res) => {
       }
     }
 
-    if (result.image) {
+    result.imageBase64 = null;
+    if (attachImage && result.image) {
       try {
         const imgUrl = result.image.startsWith("http")
           ? result.image
@@ -614,7 +600,6 @@ app.get("/", async (req, res) => {
         console.warn("Image fetch failed:", e.message);
       }
     }
-    result.imageBase64 = result.imageBase64 || null;
     res.json(result);
   } catch (e) {
     console.error("Scraper error:", e);
@@ -630,14 +615,31 @@ app.get("/", async (req, res) => {
       _error: e.message || String(e),
     });
   } finally {
-    if (browser) await browser.close();
+    if (page) await page.close().catch(() => {});
   }
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, browser: !!sharedBrowser });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Link Scraper running on port ${PORT}`);
-});
+(async () => {
+  try {
+    sharedBrowser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+      ],
+    });
+    console.log("Browser launched");
+  } catch (e) {
+    console.error("Browser launch failed:", e.message);
+  }
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Link Scraper running on port ${PORT}`);
+  });
+})();
