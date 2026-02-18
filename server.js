@@ -503,16 +503,24 @@ app.post("/analyze-image", async (req, res) => {
     return res.status(400).json({ name: "N/A", price: null, currency: null, size: null, error: "Missing image" });
   }
   try {
-    const extracted = await analyzeImage(imageBase64);
-    res.json({ ...extracted, image: null });
-    if (supabase) {
-      const rawB64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
-      const buf = Buffer.from(rawB64, "base64");
-      const path = `${randomId()}_${Date.now()}.jpg`;
-      supabase.storage.from(BUCKET).upload(path, buf, { contentType: "image/jpeg", upsert: false }).then(({ error }) => {
-        if (error) console.warn("Supabase upload failed:", error.message);
-      }).catch((e) => console.warn("Supabase upload failed:", e.message));
-    }
+    const rawB64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
+    const uploadPromise = supabase
+      ? (async () => {
+          try {
+            const buf = Buffer.from(rawB64, "base64");
+            const path = `${randomId()}_${Date.now()}.jpg`;
+            const { data: uploadData, error } = await supabase.storage.from(BUCKET).upload(path, buf, { contentType: "image/jpeg", upsert: false });
+            if (!error && uploadData) {
+              const { data: urlData } = supabase.storage.from(BUCKET).getPublicUrl(path);
+              return urlData?.publicUrl || null;
+            }
+            console.warn("Supabase upload failed:", error?.message);
+            return null;
+          } catch (e) { console.warn("Supabase upload failed:", e.message); return null; }
+        })()
+      : Promise.resolve(null);
+    const [extracted, imageUrl] = await Promise.all([analyzeImage(imageBase64), uploadPromise]);
+    res.json({ ...extracted, image: imageUrl });
   } catch (e) {
     console.error("analyze-image error:", e);
     res.status(502).json({ name: "N/A", price: null, currency: null, size: null });
