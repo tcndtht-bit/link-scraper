@@ -272,13 +272,20 @@ function extractPriceFromHtml(html) {
     /"price"\s*:\s*["']?(\d+(?:[.,]\d+)?)["']?/i,
     /"price"\s*:\s*(\d+(?:[.,]\d+)?)/,
     /"currentPrice"\s*:\s*["']?(\d+(?:[.,]\d+)?)["']?/i,
+    /"salePrice"\s*:\s*["']?(\d+(?:[.,]\d+)?)["']?/i,
+    /"basePrice"\s*:\s*["']?(\d+(?:[.,]\d+)?)["']?/i,
+    /"productPrice"\s*:\s*["']?(\d+(?:[.,]\d+)?)["']?/i,
     /data-price=["'](\d+(?:[.,]\d+)?)["']/i,
     /itemprop="price"\s+content=["'](\d+(?:[.,]\d+)?)["']/i,
     /__NEXT_DATA__[\s\S]*?"price"\s*:\s*["']?(\d+(?:[.,]\d+)?)["']?/i,
+    /(?:__NUXT__|__INITIAL_STATE__|"product")\s*[:\}][\s\S]*?"price"\s*:\s*["']?(\d+(?:[.,]\d+)?)["']?/i,
   ];
   for (const p of patterns) {
     const m = html.match(p);
-    if (m) return parseFloat(String(m[1]).replace(",", "."));
+    if (m) {
+      const n = parseFloat(String(m[1]).replace(",", "."));
+      if (!isNaN(n) && n > 0 && n < 1e9) return n;
+    }
   }
   return null;
 }
@@ -328,21 +335,58 @@ function extractJsonLd(html) {
   return null;
 }
 
+function extractFromJsonBlobs(html, baseUrl) {
+  const out = { name: null, price: null, currency: null, image: null };
+  const scriptBlocks = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi);
+  if (scriptBlocks) {
+    for (const block of scriptBlocks) {
+      const inner = block.replace(/<\/?script[^>]*>/gi, "");
+      const nameM = inner.match(/"productName"\s*:\s*"((?:[^"\\]|\\.){5,200})"/);
+      if (nameM && !out.name) out.name = nameM[1].replace(/\\"/g, '"').trim();
+      if (!out.name) {
+        const nameM2 = inner.match(/"name"\s*:\s*"((?:[^"\\]|\\.){5,200})"/);
+        if (nameM2 && !/^(true|false|null|undefined|N\/A)$/i.test(nameM2[1])) out.name = nameM2[1].replace(/\\"/g, '"').trim();
+      }
+      const priceM = inner.match(/"price"\s*:\s*(\d+(?:\.\d+)?)/);
+      if (priceM && !out.price) {
+        const n = parseFloat(priceM[1]);
+        if (n > 0 && n < 1e9) out.price = n;
+      }
+      const imgM = inner.match(/"image"\s*:\s*"((https?:\/\/[^"]+|\\/\\/[^"]+|\/[^"]+))"/);
+      if (imgM && !out.image) {
+        const url = imgM[1];
+        out.image = url.startsWith("http") ? url : (url.startsWith("//") ? "https:" + url : new URL(url, baseUrl).href);
+      }
+      if (!out.image) {
+        const imgM2 = inner.match(/"mainImage"\s*:\s*"((?:https?:\/\/[^"]+|\\/\\/[^"]+|\/[^"]+))"/);
+        if (imgM2) {
+          const u = imgM2[1];
+          out.image = u.startsWith("http") ? u : (u.startsWith("//") ? "https:" + u : new URL(u, baseUrl).href);
+        }
+      }
+    }
+  }
+  if (!out.currency && html.includes("BYN")) out.currency = "Br";
+  if (!out.currency && html.includes("goldapple")) out.currency = "Br";
+  return out;
+}
+
 function parse(html, targetUrl) {
   const title = extractTitle(html);
   const ogTitle = extractMeta(html, "og:title");
   const ogImage = extractMeta(html, "og:image");
-  const ogDesc = extractMeta(html, "og:description");
   const ogPrice = extractMeta(html, "og:price:amount");
   const ogCurrency = extractMeta(html, "og:price:currency");
   const jsonLd = extractJsonLd(html);
+  const blob = extractFromJsonBlobs(html, targetUrl);
 
-  let name = ogTitle || (jsonLd && jsonLd.name) || title || "N/A";
+  let name = ogTitle || (jsonLd && jsonLd.name) || blob.name || title || "N/A";
   let price = ogPrice ? parseFloat(ogPrice) : null;
   if (price == null && jsonLd && jsonLd.offers) {
     const off = Array.isArray(jsonLd.offers) ? jsonLd.offers[0] : jsonLd.offers;
     price = off ? (typeof off.price === "number" ? off.price : parseFloat(off.price)) : null;
   }
+  if (price == null) price = blob.price;
   if (price == null) price = extractPriceFromHtml(html);
 
   let currency = ogCurrency || null;
@@ -350,6 +394,7 @@ function parse(html, targetUrl) {
     const off = Array.isArray(jsonLd.offers) ? jsonLd.offers[0] : jsonLd.offers;
     currency = off && (off.priceCurrency || off.currency);
   }
+  if (!currency) currency = blob.currency;
   if (!currency) currency = extractCurrencyFromHtml(html);
 
   let size =
@@ -359,10 +404,12 @@ function parse(html, targetUrl) {
       jsonLd.additionalProperty.find((p) => p.name === "Размер" || p.name === "Size")?.value) ||
     null;
 
-  const imageUrl =
+  let imageUrl =
     ogImage ||
     (jsonLd && (Array.isArray(jsonLd.image) ? jsonLd.image[0] : jsonLd.image)) ||
+    blob.image ||
     null;
+  if (imageUrl && !imageUrl.startsWith("http")) imageUrl = new URL(imageUrl, targetUrl).href;
 
   return {
     name: typeof name === "string" ? name : "N/A",
@@ -481,6 +528,7 @@ app.get("/", async (req, res) => {
       waitUntil: "networkidle2",
       timeout: TIMEOUT,
     });
+    await new Promise((r) => setTimeout(r, 1500));
     const html = await page.content();
     const result = parse(html, targetUrl);
 
