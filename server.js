@@ -15,9 +15,38 @@ const PORT = process.env.PORT || 3000;
 const TIMEOUT = 25000;
 const PAGE_DELAY_MS = 700;
 const WISH_TEXT_TTL = 10 * 60 * 1000; // 10 min
+const MAX_CONCURRENT_PAGES = parseInt(process.env.MAX_PAGES || "6", 10);
+const API_KEY = process.env.SCRAPER_API_KEY || "";
+const RATE_WINDOW = 60000;
+const RATE_MAX = parseInt(process.env.RATE_MAX || "30", 10);
 
 const wishTextStore = new Map();
 let sharedBrowser = null;
+
+// ── Browser page semaphore ─────────────────────────────────
+let _activePages = 0;
+const _pageQueue = [];
+function acquirePage() {
+  return new Promise((resolve) => {
+    if (_activePages < MAX_CONCURRENT_PAGES) { _activePages++; resolve(); }
+    else _pageQueue.push(resolve);
+  });
+}
+function releasePage() {
+  _activePages--;
+  if (_pageQueue.length > 0) { _activePages++; _pageQueue.shift()(); }
+}
+
+// ── Per-IP rate limiter ────────────────────────────────────
+const _rl = {};
+function isRateLimited(ip) {
+  const now = Date.now();
+  const b = _rl[ip] || (_rl[ip] = []);
+  _rl[ip] = b.filter((t) => now - t < RATE_WINDOW);
+  if (_rl[ip].length >= RATE_MAX) return true;
+  _rl[ip].push(now);
+  return false;
+}
 
 function randomId() {
   return Math.random().toString(36).slice(2, 10);
@@ -68,13 +97,19 @@ function analyzeWishTextFallback(text) {
   return { name: s || "Желание", price, currency, size };
 }
 
+function fetchWithTimeout(url, opts, ms = 15000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
 async function analyzeWishText(text) {
   const apiKey = process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY;
   if (!apiKey) return analyzeWishTextFallback(text);
   const isGroq = !!process.env.GROQ_API_KEY;
   const url = isGroq ? "https://api.groq.com/openai/v1/chat/completions" : "https://openrouter.ai/api/v1/chat/completions";
   const model = isGroq ? "meta-llama/llama-4-scout-17b-16e-instruct" : "google/gemma-3-27b-it:free";
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
@@ -82,7 +117,7 @@ async function analyzeWishText(text) {
       messages: [{ role: "user", content: WISH_TEXT_PROMPT + "\n\n" + text }],
       max_tokens: 300,
     }),
-  });
+  }, 20000);
   if (!res.ok) return analyzeWishTextFallback(text);
   const data = await res.json();
   const t = data.choices?.[0]?.message?.content;
@@ -152,7 +187,7 @@ async function analyzeImage(imageBase64) {
   if (!providers.length) return { name: "N/A", price: null, currency: null, size: null };
   for (const p of providers) {
     try {
-      const res = await fetch(p.url, { method: "POST", headers: p.headers, body: JSON.stringify(p.body) });
+      const res = await fetchWithTimeout(p.url, { method: "POST", headers: p.headers, body: JSON.stringify(p.body) }, 20000);
       if (!res.ok) continue;
       const result = parseVisionJson(p.extract(await res.json()));
       if (result) return result;
@@ -367,8 +402,19 @@ function parse(html, targetUrl) {
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type");
+  res.set("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
   if (req.method === "OPTIONS") return res.sendStatus(204);
+  // Health check is always public
+  if (req.path === "/health") return next();
+  // API key auth (if configured)
+  if (API_KEY && req.headers["x-api-key"] !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  // Rate limit
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
+  if (isRateLimited(ip)) {
+    return res.status(429).json({ error: "Too many requests" });
+  }
   next();
 });
 
@@ -469,6 +515,7 @@ app.get("/", async (req, res) => {
 
   let page;
   try {
+    await acquirePage();
     page = await sharedBrowser.newPage();
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -551,6 +598,7 @@ app.get("/", async (req, res) => {
     });
   } finally {
     if (page) await page.close().catch(() => {});
+    releasePage();
   }
 });
 
