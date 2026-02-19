@@ -52,6 +52,23 @@ function randomId() {
   return Math.random().toString(36).slice(2, 10);
 }
 
+// ── URL response cache (avoid re-scraping same URL within TTL) ──
+const URL_CACHE_TTL = 5 * 60 * 1000;
+const _urlCache = new Map();
+function getUrlCache(url) {
+  const e = _urlCache.get(url);
+  if (!e) return null;
+  if (Date.now() - e.ts > URL_CACHE_TTL) { _urlCache.delete(url); return null; }
+  return e.data;
+}
+function setUrlCache(url, data) {
+  _urlCache.set(url, { ts: Date.now(), data });
+  if (_urlCache.size > 200) {
+    const oldest = _urlCache.keys().next().value;
+    _urlCache.delete(oldest);
+  }
+}
+
 const WISH_TEXT_PROMPT = `Текст начинается со слова «хочу». Извлеки данные. Верни ТОЛЬКО JSON:
 {"name":"строка","price":число или null,"currency":"строка или null","size":"строка или null"}
 
@@ -513,6 +530,10 @@ app.get("/", async (req, res) => {
     return res.status(503).json({ error: "Browser not ready" });
   }
 
+  const cacheKey = attachImage ? targetUrl + "#img" : targetUrl;
+  const cached = getUrlCache(cacheKey);
+  if (cached) return res.json({ ...cached, _cached: true });
+
   let page;
   try {
     await acquirePage();
@@ -582,6 +603,7 @@ app.get("/", async (req, res) => {
         console.warn("Image fetch failed:", e.message);
       }
     }
+    setUrlCache(cacheKey, result);
     res.json(result);
   } catch (e) {
     console.error("Scraper error:", e);
